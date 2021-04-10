@@ -1,0 +1,115 @@
+#! /usr/bin/python3
+
+import sys
+import requests
+import logging
+import types
+import argparse
+import time
+import signal
+
+from enum import Enum
+
+class ExitCode(Enum):
+    SUCCESS = 0
+    NO_METRICS = 1
+    BROKEN_EXPORTER = 2
+
+class ColorFormatter(logging.Formatter):
+    cyan        = "\x1b[0;36m"
+    green       = "\x1b[0;32m"
+    bold_yellow = "\x1b[1;33m"
+    red         = "\x1b[0;31m"
+    bold_red    = "\x1b[1;31m"
+    purple      = "\x1b[0;35m"
+    bold_purple = "\x1b[1;35m"
+    reset       = "\x1b[0m"
+    width       = "8.8"
+
+    FORMATS = {
+        logging.DEBUG   : f"{cyan}%(levelname){width}s{reset} %(message)s",
+        logging.INFO    : f"{green}%(levelname){width}s{reset} %(message)s",
+        logging.WARNING : f"{bold_yellow}%(levelname){width}s{reset} %(message)s",
+        logging.ERROR   : f"{bold_red}%(levelname){width}s{red} %(message)s{reset}",
+        logging.CRITICAL: f"{bold_purple}%(levelname){width}s{purple} %(message)s{reset}",
+    }
+
+    def format(self, record):
+        log_fmt = self.FORMATS.get(record.levelno)
+        formatter = logging.Formatter(log_fmt)
+        return formatter.format(record)
+
+def bail(self, msg, code):
+    self.critical(f"{msg}, exiting with {code.name}:{code.value}...")
+    sys.exit(code.value)
+
+parser = argparse.ArgumentParser(description="Log prometheus metrics as csv")
+levels = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+parser.add_argument("-l", "--log-level", default="INFO", choices=levels, help="the log level on stderr for this application")
+parser.add_argument("-i", "--interval", default=100, type=int, help="polling interval in ms")
+parser.add_argument("-d", "--delimiter", type=str, default=",", help="CSV delimiter character")
+parser.add_argument("-u", "--url", required=True, help="the prometheus exporter url")
+parser.add_argument("-m", "--metric", dest="metrics", action="append", help="the metric names to record")
+parser.add_argument("-s", "--show", action="store_true", help="show available metrics and exit")
+
+options = parser.parse_args()
+
+log = logging.getLogger("prom2csv")
+log.setLevel(options.log_level)
+hdl = logging.StreamHandler()
+hdl.setLevel(logging.DEBUG)
+hdl.setFormatter(ColorFormatter())
+log.addHandler(hdl)
+log.bail = types.MethodType(bail, log)
+
+if options.show:
+    log.info("fetching available metrics...")
+    try:
+        response = requests.get(options.url)
+    except Exception as e:
+        log.bail(f"Failed to fetch prometheus metrics: {e}", ExitCode.NO_METRICS)
+
+    log.info("the following metrics are available:")
+    for line in response.content.splitlines():
+        line = line.decode('utf-8')
+        if line.startswith("#"):
+            continue
+        [name, _] = line.rsplit(" ", 1)
+        print(name)
+    sys.exit(ExitCode.SUCCESS.value)
+
+if options.metrics is None:
+    log.bail("No metrics provided for logging", ExitCode.NO_METRICS)
+
+def signal_handler(sig, frame):
+    log.info("Quitting...")
+    sys.exit(ExitCode.SUCCESS.value)
+signal.signal(signal.SIGINT, signal_handler)
+    
+log.info("Tip: You can pipe stdout to a file to store the CSV on disk!")
+log.info("Tip: Press Ctrl+C or send SIGINT to quit!")
+log.info(f"Listening on {options.url} for {len(options.metrics)} metrics...")
+
+print(options.delimiter.join(["time"] + options.metrics))
+
+interval = float(options.interval) / 1000.0
+iteration = 1
+begin = time.time()
+while True:
+    timestamp = (time.time() - begin) * 1000
+    try:
+        response = requests.get(options.url)
+    except Exception as e:
+        log.bail(f"Failed to fetch prometheus metrics: {e}", ExitCode.BROKEN_EXPORTER)
+
+    metrics = dict()
+    for line in response.content.splitlines():
+        line = line.decode('utf-8')
+        if line.startswith("#"):
+            continue
+        [name, value] = line.rsplit(" ", 1)
+        if name in options.metrics:
+            metrics[name] = value
+    print(options.delimiter.join([str(int(timestamp))] + [metrics[name] for name in options.metrics]))
+    time.sleep((begin + iteration * interval) - time.time())
+    iteration += 1
